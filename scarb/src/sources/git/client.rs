@@ -8,14 +8,15 @@
 //!    repositories as source of super important information.
 
 use std::fmt;
-use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8PathBuf;
+use tokio::process::Command;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::core::{Config, GitReference};
 use crate::flock::Filesystem;
-use crate::process::exec;
+use crate::process::async_exec;
 use crate::ui::Verbosity;
 
 use super::canonical_url::CanonicalUrl;
@@ -44,7 +45,7 @@ impl fmt::Debug for GitRemote {
 pub struct GitDatabase {
     remote: GitRemote,
     path: Utf8PathBuf,
-    repo: gix::Repository,
+    repo: Mutex<gix::Repository>,
 }
 
 impl fmt::Debug for GitDatabase {
@@ -97,7 +98,7 @@ impl GitRemote {
     }
 
     #[tracing::instrument(level = "trace", skip(config))]
-    pub fn checkout(
+    pub async fn checkout(
         &self,
         fs: &Filesystem<'_>,
         db: Option<GitDatabase>,
@@ -110,15 +111,16 @@ impl GitRemote {
         // version of `reference`, so return that database and the rev we resolve to.
         if let Some(db) = db {
             db.fetch(self.url.as_str(), reference, config)
+                .await
                 .with_context(|| format!("failed to fetch into: {fs}"))?;
             match locked_rev {
                 Some(rev) => {
-                    if db.contains(rev) {
+                    if db.contains(rev).await {
                         return Ok((db, rev));
                     }
                 }
                 None => {
-                    if let Ok(rev) = db.resolve(reference) {
+                    if let Ok(rev) = db.resolve(reference).await {
                         return Ok((db, rev));
                     }
                 }
@@ -133,10 +135,11 @@ impl GitRemote {
         }
         let db = GitDatabase::init_bare(self, fs)?;
         db.fetch(self.url.as_str(), reference, config)
+            .await
             .with_context(|| format!("failed to clone into: {fs}"))?;
         let rev = match locked_rev {
             Some(rev) => rev,
-            None => db.resolve(reference)?,
+            None => db.resolve(reference).await?,
         };
         Ok((db, rev))
     }
@@ -151,7 +154,7 @@ impl GitDatabase {
         Ok(Self {
             remote: remote.clone(),
             path: path.to_path_buf(),
-            repo,
+            repo: repo.into(),
         })
     }
 
@@ -162,12 +165,16 @@ impl GitDatabase {
         Ok(Self {
             remote: remote.clone(),
             path: path.to_path_buf(),
-            repo,
+            repo: repo.into(),
         })
     }
 
+    async fn repo(&self) -> MutexGuard<'_, gix::Repository> {
+        self.repo.lock().await
+    }
+
     #[tracing::instrument(level = "trace", skip(config))]
-    fn fetch(&self, url: &str, reference: &GitReference, config: &Config) -> Result<()> {
+    async fn fetch(&self, url: &str, reference: &GitReference, config: &Config) -> Result<()> {
         if !config.network_allowed() {
             bail!("cannot fetch from `{}` in offline mode", self.remote);
         }
@@ -186,29 +193,32 @@ impl GitDatabase {
         cmd.arg("--update-head-ok");
         cmd.arg(url);
         cmd.args(refspecs);
-        cmd.current_dir(self.repo.path());
-        exec(&mut cmd, config)
+        cmd.current_dir(self.repo().await.path());
+        async_exec(&mut cmd, config).await
     }
 
-    pub fn copy_to(
+    pub async fn copy_to(
         &self,
         fs: &Filesystem<'_>,
         rev: Rev,
         config: &Config,
     ) -> Result<GitCheckout<'_>> {
-        let checkout = GitCheckout::clone(self, fs, rev, config)?;
-        checkout.reset(config)?;
+        let checkout = GitCheckout::clone(self, fs, rev, config).await?;
+        checkout.reset(config).await?;
         Ok(checkout)
     }
 
-    pub fn contains(&self, rev: Rev) -> bool {
-        self.repo.rev_parse_single(rev.oid.as_bytes()).is_ok()
+    pub async fn contains(&self, rev: Rev) -> bool {
+        self.repo()
+            .await
+            .rev_parse_single(rev.oid.as_bytes())
+            .is_ok()
     }
 
     #[tracing::instrument(level = "trace")]
-    pub fn resolve(&self, reference: &GitReference) -> Result<Rev> {
+    pub async fn resolve(&self, reference: &GitReference) -> Result<Rev> {
         use GitReference::*;
-        let repo = &self.repo;
+        let repo = self.repo().await;
         match reference {
             Tag(t) => Ok(repo
                 .try_find_reference(&format!("refs/remotes/origin/tags/{t}"))
@@ -243,15 +253,21 @@ impl GitDatabase {
         }
     }
 
-    pub fn short_id_of(&self, rev: Rev) -> Result<String> {
-        let obj = self.repo.find_object(rev.oid)?;
+    pub async fn short_id_of(&self, rev: Rev) -> Result<String> {
+        let repo = self.repo().await;
+        let obj = repo.find_object(rev.oid)?;
         Ok(obj.id().shorten_or_id().to_string())
     }
 }
 
 impl<'d> GitCheckout<'d> {
     #[tracing::instrument(level = "trace", skip(config))]
-    fn clone(db: &'d GitDatabase, fs: &Filesystem<'_>, rev: Rev, config: &Config) -> Result<Self> {
+    async fn clone(
+        db: &'d GitDatabase,
+        fs: &Filesystem<'_>,
+        rev: Rev,
+        config: &Config,
+    ) -> Result<GitCheckout<'d>> {
         unsafe {
             fs.recreate()?;
         }
@@ -263,20 +279,21 @@ impl<'d> GitCheckout<'d> {
         with_verbosity_flags(&mut cmd, config);
         cmd.args(["--config", "core.autocrlf=false"]);
         cmd.arg("--recurse-submodules");
-        cmd.arg(db.repo.path());
+        let repo = db.repo().await;
+        cmd.arg(repo.path());
         cmd.arg(&location);
-        exec(&mut cmd, config)?;
+        async_exec(&mut cmd, config).await?;
 
         Ok(Self { db, location, rev })
     }
 
     #[tracing::instrument(level = "trace", skip(config))]
-    fn reset(&self, config: &Config) -> Result<()> {
+    async fn reset(&self, config: &Config) -> Result<()> {
         let mut cmd = git_command();
         cmd.args(["reset", "--hard"]);
         cmd.arg(self.rev.to_string());
         cmd.current_dir(&self.location);
-        exec(&mut cmd, config)
+        async_exec(&mut cmd, config).await
     }
 }
 

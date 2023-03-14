@@ -7,7 +7,7 @@ use assert_fs::TempDir;
 use snapbox::cmd::cargo_bin;
 use snapbox::cmd::Command as SnapboxCommand;
 
-use scarb::core::Config;
+use scarb::core::{Config, ConfigBuilder};
 use scarb::ui::Verbosity;
 
 use crate::support::fsx::{AssertFsUtf8Ext, PathUtf8Ext};
@@ -51,7 +51,7 @@ impl Scarb {
         cmd
     }
 
-    pub fn test_config(manifest: impl AssertFsUtf8Ext) -> Config {
+    pub fn test_config_builder(manifest: impl AssertFsUtf8Ext) -> ConfigBuilder {
         let cache_dir = TempDir::new().unwrap();
         let config_dir = TempDir::new().unwrap();
 
@@ -61,8 +61,10 @@ impl Scarb {
             .path_env_override(Some(iter::empty::<PathBuf>()))
             .ui_verbosity(Verbosity::Verbose)
             .log_filter_directive(Some("scarb=trace"))
-            .build()
-            .unwrap()
+    }
+
+    pub fn test_config(manifest: impl AssertFsUtf8Ext) -> Config {
+        Self::test_config_builder(manifest).build().unwrap()
     }
 }
 

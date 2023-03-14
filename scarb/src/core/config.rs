@@ -7,6 +7,7 @@ use std::{env, mem};
 use anyhow::{anyhow, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use once_cell::sync::OnceCell;
+use tokio::runtime::{Builder, Handle, Runtime};
 use tracing::trace;
 use which::which_in;
 
@@ -32,6 +33,8 @@ pub struct Config {
     log_filter_directive: OsString,
     offline: bool,
     compilers: CompilerRepository,
+    tokio_runtime: OnceCell<Runtime>,
+    runtime_handle: OnceCell<Handle>,
 }
 
 impl Config {
@@ -65,6 +68,10 @@ impl Config {
             }));
 
         let compilers = b.compilers.unwrap_or_else(CompilerRepository::std);
+        let runtime_handle: OnceCell<Handle> = OnceCell::new();
+        if let Some(handle) = b.runtime_handle {
+            runtime_handle.set(handle).unwrap();
+        }
 
         Ok(Self {
             manifest_path: b.manifest_path,
@@ -77,6 +84,8 @@ impl Config {
             log_filter_directive: b.log_filter_directive.unwrap_or_default(),
             offline: b.offline,
             compilers,
+            tokio_runtime: OnceCell::new(),
+            runtime_handle,
         })
     }
 
@@ -171,6 +180,16 @@ impl Config {
         not_static_al
     }
 
+    fn tokio_runtime(&self) -> &Runtime {
+        self.tokio_runtime
+            .get_or_init(|| Builder::new_multi_thread().enable_all().build().unwrap())
+    }
+
+    pub fn runtime_handle(&self) -> &Handle {
+        self.runtime_handle
+            .get_or_init(|| self.tokio_runtime().handle().clone())
+    }
+
     /// States whether the _Offline Mode_ is turned on.
     ///
     /// For checking whether Scarb can communicate with the network, prefer to use
@@ -202,6 +221,7 @@ pub struct ConfigBuilder {
     offline: bool,
     log_filter_directive: Option<OsString>,
     compilers: Option<CompilerRepository>,
+    runtime_handle: Option<Handle>,
 }
 
 impl ConfigBuilder {
@@ -217,6 +237,7 @@ impl ConfigBuilder {
             offline: false,
             log_filter_directive: None,
             compilers: None,
+            runtime_handle: None,
         }
     }
 
@@ -278,6 +299,11 @@ impl ConfigBuilder {
 
     pub fn compilers(mut self, compilers: CompilerRepository) -> Self {
         self.compilers = Some(compilers);
+        self
+    }
+
+    pub fn runtime_handle(mut self, runtime_handle: Handle) -> Self {
+        self.runtime_handle = Some(runtime_handle);
         self
     }
 }

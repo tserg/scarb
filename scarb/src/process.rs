@@ -1,12 +1,13 @@
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Read};
+use std::fmt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::{fmt, thread};
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, debug_span, warn, Span};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tracing::{debug, debug_span, warn};
+use tracing_futures::Instrument;
 
 use crate::core::Config;
 use crate::ui::{Spinner, Status};
@@ -49,61 +50,57 @@ pub fn exec_replace(cmd: &mut Command) -> Result<()> {
 
 /// Runs the process, waiting for completion, and mapping non-success exit codes to an error.
 #[tracing::instrument(level = "trace", skip_all)]
-pub fn exec(cmd: &mut Command, config: &Config) -> Result<()> {
-    let cmd_str = shlex_join(cmd);
+pub async fn async_exec(cmd: &mut tokio::process::Command, config: &Config) -> Result<()> {
+    let cmd_str = shlex_join(cmd.as_std());
 
     config.ui().verbose(Status::new("Running", &cmd_str));
     let _spinner = config.ui().widget(Spinner::new(cmd_str.clone()));
 
-    return thread::scope(move |s| {
-        let mut proc = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| anyhow!("could not execute process: {cmd_str}"))?;
-
-        let span = Arc::new(debug_span!("exec", pid = proc.id()));
-        let _enter = span.enter();
-        debug!("{cmd_str}");
-
-        let stdout = proc.stdout.take().expect("we asked Rust to pipe stdout");
-        s.spawn({
-            let span = debug_span!("out");
-            move || {
-                let mut stdout = stdout;
-                pipe_to_logs(&span, &mut stdout);
-            }
-        });
-
-        let stderr = proc.stderr.take().expect("we asked Rust to pipe stderr");
-        s.spawn({
-            let span = debug_span!("err");
-            move || {
-                let mut stderr = stderr;
-                pipe_to_logs(&span, &mut stderr);
-            }
-        });
-
-        let exit_status = proc
-            .wait()
-            .with_context(|| anyhow!("could not wait for proces termination: {cmd_str}"))?;
-        if exit_status.success() {
-            Ok(())
-        } else {
-            bail!("process did not exit successfully: {exit_status}");
-        }
-    });
-
-    fn pipe_to_logs(span: &Span, stream: &mut dyn Read) {
-        let _enter = span.enter();
-        let stream = BufReader::with_capacity(128, stream);
-        for line in stream.lines() {
+    async fn pipe_to_logs<T: AsyncRead + Unpin>(stream: T) {
+        let mut reader = BufReader::new(stream).lines();
+        loop {
+            let line = reader.next_line().await;
             match line {
-                Ok(line) => debug!("{line}"),
+                Ok(Some(line)) => debug!("{line}"),
+                Ok(None) => break,
                 Err(err) => warn!("{err:?}"),
             }
         }
+    }
+    let runtime = config.runtime_handle();
+    let mut proc = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| anyhow!("could not execute process: {cmd_str}"))?;
+
+    let span = Arc::new(debug_span!("exec", pid = proc.id()));
+    let _enter = span.enter();
+    debug!("{cmd_str}");
+
+    let stdout = proc.stdout.take().expect("we asked Rust to pipe stdout");
+    let span = debug_span!("out");
+    runtime.spawn(async move {
+        let mut stdout = stdout;
+        pipe_to_logs(&mut stdout).instrument(span).await;
+    });
+
+    let stderr = proc.stderr.take().expect("we asked Rust to pipe stderr");
+    runtime.spawn(async move {
+        let span = debug_span!("err");
+        let mut stderr = stderr;
+        pipe_to_logs(&mut stderr).instrument(span).await
+    });
+
+    let exit_status = proc
+        .wait()
+        .await
+        .with_context(|| anyhow!("could not wait for proces termination: {cmd_str}"))?;
+    if exit_status.success() {
+        Ok(())
+    } else {
+        bail!("process did not exit successfully: {exit_status}");
     }
 }
 

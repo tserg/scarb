@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use futures::TryFutureExt;
 
 use crate::compiler::{CompilationUnit, Profile};
 use crate::core::package::{Package, PackageId};
@@ -9,7 +10,6 @@ use crate::core::registry::source_map::SourceMap;
 use crate::core::registry::Registry;
 use crate::core::resolver::Resolve;
 use crate::core::workspace::Workspace;
-use crate::internal::asyncx::AwaitSync;
 use crate::resolver;
 
 pub struct WorkspaceResolve {
@@ -36,22 +36,25 @@ impl WorkspaceResolve {
     fields(root = ws.root().to_string())
 )]
 pub fn resolve_workspace(ws: &Workspace<'_>) -> Result<WorkspaceResolve> {
-    async {
-        let source_map = SourceMap::preloaded(ws.members(), ws.config());
-        let mut registry_cache = RegistryCache::new(source_map);
+    ws.config().runtime_handle().block_on(
+        async {
+            let source_map = SourceMap::preloaded(ws.members(), ws.config());
+            let mut registry_cache = RegistryCache::new(source_map);
 
-        let members_summaries = ws
-            .members()
-            .map(|pkg| pkg.manifest.summary.clone())
-            .collect::<Vec<_>>();
+            let members_summaries = ws
+                .members()
+                .map(|pkg| pkg.manifest.summary.clone())
+                .collect::<Vec<_>>();
 
-        let resolve = resolver::resolve(&members_summaries, &mut registry_cache).await?;
+            let resolve = resolver::resolve(&members_summaries, &mut registry_cache).await?;
 
-        let packages = collect_packages_from_resolve_graph(&resolve, &mut registry_cache).await?;
+            let packages =
+                collect_packages_from_resolve_graph(&resolve, &mut registry_cache).await?;
 
-        Ok(WorkspaceResolve { resolve, packages })
-    }
-    .await_sync()
+            Ok(WorkspaceResolve { resolve, packages })
+        }
+        .into_future(),
+    )
 }
 
 #[tracing::instrument(skip_all, level = "debug")]

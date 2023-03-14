@@ -2,7 +2,7 @@
 //!
 //! For read operations and workspace mutations, see [`crate::ops`] module.
 
-pub use config::Config;
+pub use config::{Config, ConfigBuilder};
 pub use dirs::AppDirs;
 pub use manifest::{
     DetailedTomlDependency, ExternalTargetKind, LibTargetKind, Manifest, ManifestCompilerConfig,

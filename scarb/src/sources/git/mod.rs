@@ -1,9 +1,8 @@
-use std::{fmt, mem};
+use std::fmt;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use smol::lock::OnceCell;
-use smol::unblock;
+use tokio::sync::OnceCell;
 use url::Url;
 
 use canonical_url::CanonicalUrl;
@@ -76,70 +75,56 @@ impl<'c> GitSource<'c> {
         let remote = self.remote.clone();
         let requested_reference = self.requested_reference.clone();
         let locked_rev = self.locked_rev;
+        let remote_ident = remote.ident();
 
-        // HACK: We know that we will not use &Config outside scope of this function,
-        //   but `smol::unblock` lifetime bounds force us to think so.
-        let config: &'static Config = unsafe { mem::transmute(self.config) };
+        let registry_fs = self.config.dirs().registry_dir();
+        let git_fs = registry_fs.child("git");
+        let all_db_fs = git_fs.child("db");
 
-        return unblock(move || inner(source_id, remote, requested_reference, locked_rev, config))
-            .await;
+        let db_fs = all_db_fs.child(format!("{remote_ident}.git"));
+        let db = GitDatabase::open(&remote, &db_fs).ok();
+        let (db, actual_rev) = match (db, locked_rev) {
+            // If we have a locked revision, and we have a preexisting database
+            // which has that revision, then no update needs to happen.
+            (Some(db), Some(rev)) if db.contains(rev).await => (db, rev),
 
-        fn inner(
-            source_id: SourceId,
-            remote: GitRemote,
-            requested_reference: GitReference,
-            locked_rev: Option<Rev>,
-            config: &Config,
-        ) -> Result<InnerState<'_>> {
-            let remote_ident = remote.ident();
-
-            let registry_fs = config.dirs().registry_dir();
-            let git_fs = registry_fs.child("git");
-            let all_db_fs = git_fs.child("db");
-
-            let db_fs = all_db_fs.child(&format!("{remote_ident}.git"));
-            let db = GitDatabase::open(&remote, &db_fs).ok();
-            let (db, actual_rev) = match (db, locked_rev) {
-                // If we have a locked revision, and we have a preexisting database
-                // which has that revision, then no update needs to happen.
-                (Some(db), Some(rev)) if db.contains(rev) => (db, rev),
-
-                // If Scarb is in offline mode, source is not locked to particular revision,
-                // and there is a functional database, then try to resolve our reference
-                // with the preexisting repository.
-                (Some(db), None) if !config.network_allowed() => {
-                    let rev = db.resolve(&requested_reference).context(
-                        "failed to lookup reference in preexisting repository, and \
+            // If Scarb is in offline mode, source is not locked to particular revision,
+            // and there is a functional database, then try to resolve our reference
+            // with the preexisting repository.
+            (Some(db), None) if !self.config.network_allowed() => {
+                let rev = db.resolve(&requested_reference).await.context(
+                    "failed to lookup reference in preexisting repository, and \
                         cannot check for updates in offline mode (--offline)",
-                    )?;
-                    (db, rev)
+                )?;
+                (db, rev)
+            }
+
+            // Now we can freely update the database.
+            (db, locked_rev) => {
+                // The actual error will be produced by `checkout`.
+                if self.config.network_allowed() {
+                    self.config
+                        .ui()
+                        .print(Status::new("Updating", &format!("git repository {remote}")));
                 }
 
-                // Now we can freely update the database.
-                (db, locked_rev) => {
-                    // The actual error will be produced by `checkout`.
-                    if config.network_allowed() {
-                        config
-                            .ui()
-                            .print(Status::new("Updating", &format!("git repository {remote}")));
-                    }
+                remote
+                    .checkout(&db_fs, db, &requested_reference, locked_rev, self.config)
+                    .await?
+            }
+        };
 
-                    remote.checkout(&db_fs, db, &requested_reference, locked_rev, config)?
-                }
-            };
+        let all_checkouts_fs = git_fs.child("checkouts");
+        let db_checkouts_fs = all_checkouts_fs.child(&remote_ident);
+        let checkout_fs = db_checkouts_fs.child(db.short_id_of(actual_rev).await?);
+        let checkout = db.copy_to(&checkout_fs, actual_rev, self.config).await?;
 
-            let all_checkouts_fs = git_fs.child("checkouts");
-            let db_checkouts_fs = all_checkouts_fs.child(&remote_ident);
-            let checkout_fs = db_checkouts_fs.child(db.short_id_of(actual_rev)?);
-            let checkout = db.copy_to(&checkout_fs, actual_rev, config)?;
+        let path_source = PathSource::recursive_at(&checkout.location, source_id, self.config);
 
-            let path_source = PathSource::recursive_at(&checkout.location, source_id, config);
-
-            Ok(InnerState {
-                path_source,
-                actual_rev,
-            })
-        }
+        Ok(InnerState {
+            path_source,
+            actual_rev,
+        })
     }
 }
 
