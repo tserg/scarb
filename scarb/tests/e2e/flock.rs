@@ -84,14 +84,12 @@ async fn locking_package_cache() {
         .build(&t);
 
     let manifest = t.child("Scarb.toml");
-    let handle = tokio::runtime::Handle::current();
-    let builder = Scarb::test_config_builder(manifest);
-    let config = builder.runtime_handle(handle).build().unwrap();
+    let config = Scarb::test_config(manifest);
 
     let lock = config.package_cache_lock().acquire_async().await;
     let barrier = Arc::new(Barrier::new(2));
 
-    config.runtime_handle().spawn({
+    tokio::spawn({
         let barrier = barrier.clone();
 
         async move {

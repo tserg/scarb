@@ -67,7 +67,7 @@ pub async fn async_exec(cmd: &mut tokio::process::Command, config: &Config) -> R
             }
         }
     }
-    let runtime = config.runtime_handle();
+    let runtime = config.tokio_handle();
     let mut proc = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -36,7 +36,7 @@ impl WorkspaceResolve {
     fields(root = ws.root().to_string())
 )]
 pub fn resolve_workspace(ws: &Workspace<'_>) -> Result<WorkspaceResolve> {
-    ws.config().runtime_handle().block_on(
+    ws.config().tokio_handle().block_on(
         async {
             let source_map = SourceMap::preloaded(ws.members(), ws.config());
             let mut registry_cache = RegistryCache::new(source_map);

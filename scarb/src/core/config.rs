@@ -34,7 +34,7 @@ pub struct Config {
     offline: bool,
     compilers: CompilerRepository,
     tokio_runtime: OnceCell<Runtime>,
-    runtime_handle: OnceCell<Handle>,
+    tokio_handle: OnceCell<Handle>,
 }
 
 impl Config {
@@ -68,9 +68,9 @@ impl Config {
             }));
 
         let compilers = b.compilers.unwrap_or_else(CompilerRepository::std);
-        let runtime_handle: OnceCell<Handle> = OnceCell::new();
-        if let Some(handle) = b.runtime_handle {
-            runtime_handle.set(handle).unwrap();
+        let tokio_handle: OnceCell<Handle> = OnceCell::new();
+        if let Some(handle) = b.tokio_handle {
+            tokio_handle.set(handle).unwrap();
         }
 
         Ok(Self {
@@ -85,7 +85,7 @@ impl Config {
             offline: b.offline,
             compilers,
             tokio_runtime: OnceCell::new(),
-            runtime_handle,
+            tokio_handle,
         })
     }
 
@@ -180,14 +180,21 @@ impl Config {
         not_static_al
     }
 
-    fn tokio_runtime(&self) -> &Runtime {
-        self.tokio_runtime
-            .get_or_init(|| Builder::new_multi_thread().enable_all().build().unwrap())
-    }
+    pub fn tokio_handle(&self) -> &Handle {
+        self.tokio_handle.get_or_init(|| {
+            // No tokio runtime handle stored yet.
+            if let Ok(handle) = Handle::try_current() {
+                // Check if we're already in a tokio runtime.
+                handle
+            } else {
+                // Otherwise, start a new one.
+                let runtime = self
+                    .tokio_runtime
+                    .get_or_init(|| Builder::new_multi_thread().enable_all().build().unwrap());
 
-    pub fn runtime_handle(&self) -> &Handle {
-        self.runtime_handle
-            .get_or_init(|| self.tokio_runtime().handle().clone())
+                runtime.handle().clone()
+            }
+        })
     }
 
     /// States whether the _Offline Mode_ is turned on.
@@ -221,7 +228,7 @@ pub struct ConfigBuilder {
     offline: bool,
     log_filter_directive: Option<OsString>,
     compilers: Option<CompilerRepository>,
-    runtime_handle: Option<Handle>,
+    tokio_handle: Option<Handle>,
 }
 
 impl ConfigBuilder {
@@ -237,7 +244,7 @@ impl ConfigBuilder {
             offline: false,
             log_filter_directive: None,
             compilers: None,
-            runtime_handle: None,
+            tokio_handle: None,
         }
     }
 
@@ -302,8 +309,8 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn runtime_handle(mut self, runtime_handle: Handle) -> Self {
-        self.runtime_handle = Some(runtime_handle);
+    pub fn tokio_handle(mut self, tokio_handle: Handle) -> Self {
+        self.tokio_handle = Some(tokio_handle);
         self
     }
 }
